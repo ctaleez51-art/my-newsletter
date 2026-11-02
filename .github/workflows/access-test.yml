@@ -1,0 +1,22 @@
+name: access-test
+
+# GitHub 서버(해외)에서 세법 소스 4곳에 접속되는지 확인한다. 수동 실행만.
+on:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 소스 접속 확인
+        run: |
+          check() {
+            result=$(curl -s -o /dev/null -L --max-time 20 \
+              -A "Mozilla/5.0" \
+              -w "%{http_code} %{time_total}s" "$2" || echo "실패(코드 $?)")
+            echo "$1 | $result | $2"
+          }
+          check "국세청 보도자료" "https://www.nts.go.kr/nts/na/ntt/selectNttList.do?mi=2201&bbsId=1028"
+          check "국세청 공지사항" "https://www.nts.go.kr/nts/na/ntt/selectNttList.do?mi=2207&bbsId=1011"
+          check "국세법령정보시스템" "https://taxlaw.nts.go.kr/pd/USEPDI001M.do"
+          check "홈택스" "https://hometax.go.kr/websquare/websquare.html?w2xPath=/ui/pp/index_pp.xml"
