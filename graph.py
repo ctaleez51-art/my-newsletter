@@ -15,6 +15,7 @@ import requests
 import yaml
 from dotenv import load_dotenv
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import Send
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
@@ -244,10 +245,13 @@ def ask_picks(items, n):
 
 def select(s: dict) -> dict:                   # ② 중요도 선별 — 예선(소스 종류별) → 본선
     items, per, target = s["collected"], AUDIENCE["per_group"], AUDIENCE["target"]
-    log = []
+    # 자세히 다룰 후보는 본문에 글자가 있는 글(정상)만. 이미지·첨부뿐인 글을 요약시키면 제목만 보고 지어낸다.
+    # 후보에서 빠진 글도 목록에는 제목·링크로 실린다.
+    textless = [it for it in items if it["status"] != "정상"]
+    log = [f"   후보 제외 (본문 글자 없음) {len(textless)}건 — 목록에는 실림"] if textless else []
     survivors = []                              # (글, 예선에서 붙은 이유·라벨 또는 None)
     for group, sources in AUDIENCE["groups"].items():
-        chunk = [it for it in items if it["source"] in sources]
+        chunk = [it for it in items if it["source"] in sources and it["status"] == "정상"]
         if len(chunk) <= per:                   # 고를 필요가 없으면 LLM 을 부르지 않는다
             survivors += [(it, None) for it in chunk]
             log.append(f"   예선 {group}: {len(chunk)}건 → 전부 통과 ({per}건 이하)")
@@ -282,8 +286,43 @@ def select(s: dict) -> dict:                   # ② 중요도 선별 — 예선
             "log": [f"② 선별   {len(items)} → 예선 {len(survivors)} → {len(picked)}건"] + log}
 
 
-def report(s: dict) -> dict:                   # ③ 요약
-    return {"drafted": [], "log": [f"③ 취재   {len(s['picked'])}건 (빈 노드)"]}
+# ── ③ 요약: 선정된 글마다 워커 하나 (Send 팬아웃) ───────────────────────
+
+class Draft(BaseModel):
+    headline: str = Field(description="20자 내외의 한국어 헤드라인")
+    summary:  str = Field(description="세 문장 요약. ~합니다체, 과장 없이 건조하게")
+    why:      str = Field(description="사업자·세무사무실이 무엇을 챙겨야 하는지, 왜 중요한지 한 문장")
+
+
+DRAFT_SYS = (f"당신은 세법 소식 뉴스레터 기자입니다. 독자는 {AUDIENCE['audience']}\n"
+             "아래 원문을 읽고 헤드라인·요약·왜 중요한지를 쓰세요.\n"
+             "원문에 없는 날짜·금액·대상·조건은 쓰지 마세요.\n"
+             "'주목된다·기대를 모은다' 같은 기자체 표현은 쓰지 마세요.")
+
+
+class ReportIn(TypedDict):                     # 워커가 받는 것은 글 하나뿐
+    item: dict
+
+
+def fan_report(s: dict):                       # 선정된 글 수만큼 워커를 펼친다
+    if not s["picked"]:
+        return ["verify"]                      # 고른 글이 없으면 펼칠 것 없이 다음으로
+    return [Send("report", {"item": it}) for it in s["picked"]]
+
+
+def report(s: ReportIn) -> dict:               # ③ 요약 — 글 한 건을 맡는다
+    it = s["item"]
+    body = it["body"][:6000]                   # 본문은 collect 에서 이미 받아 두었다
+    try:
+        d = llm().chat.completions.parse(
+            model="gpt-4.1-mini", temperature=0,
+            messages=[{"role": "system", "content": DRAFT_SYS},
+                      {"role": "user", "content": f"제목: {it['title']}\n\n{body}"}],
+            response_format=Draft).choices[0].message.parsed
+    except Exception as e:                     # 한 건이 실패해도 나머지 워커는 계속
+        return {"drafted": [], "log": [f"③ 취재 실패 [{it['source']}] {it['title'][:40]} ({type(e).__name__})"]}
+    return {"drafted": [{**it, "body": body, **d.model_dump()}],
+            "log": [f"③ 취재   [{it['source']}] {d.headline}"]}
 
 
 def verify(s: dict) -> dict:                   # ④ 검수
@@ -300,7 +339,7 @@ def build():                                    # 노드를 이름으로 찾아 
         g.add_node(name, globals()[name])
     g.add_edge(START, "collect")
     g.add_edge("collect", "select")
-    g.add_edge("select", "report")
+    g.add_conditional_edges("select", fan_report, ["report", "verify"])   # 고정 엣지 대신 팬아웃
     g.add_edge("report", "verify")
     g.add_edge("verify", "publish")
     g.add_edge("publish", END)
