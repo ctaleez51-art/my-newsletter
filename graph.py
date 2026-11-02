@@ -12,7 +12,11 @@ from pathlib import Path
 from typing import Annotated, TypedDict
 
 import requests
+import yaml
+from dotenv import load_dotenv
 from langgraph.graph import END, START, StateGraph
+from openai import OpenAI
+from pydantic import BaseModel, Field
 
 STORE = Path(__file__).parent / "store"
 SEEN = STORE / "seen.json"          # 지난번까지 가져온 글 번호. 발행이 끝난 뒤에 갱신한다(⑤).
@@ -193,8 +197,89 @@ def collect(s: dict) -> dict:                  # ① 자료 수집 — 지난번
                     + (f" · 응답 없음 {dead}" if dead else "")] + lines}
 
 
-def select(s: dict) -> dict:                   # ② 중요도 선별
-    return {"picked": [], "log": [f"② 선별   {len(s['collected'])} → 0건 (빈 노드)"]}
+# ── ② 선별: 소스 종류별 예선 → 본선 ──────────────────────────────────
+# 묶음은 건수가 아니라 소스 종류(audience.yaml groups)로 나눈다. 판례가 건수로 소식을 덮지 않게 하고,
+# "새 소식이 메인"이라는 기준을 구조에도 반영하기 위해서다. 고르지 않은 글도 버리지 않는다(목록에 실린다).
+
+class Pick(BaseModel):
+    index: int = Field(description="후보 목록에서의 번호")
+    reason: str = Field(description="왜 골랐는지 한 문장")
+    event: str = Field(description="이 글이 다루는 사건을 짧은 라벨로. 같은 사건이면 같은 라벨")
+
+
+class Shortlist(BaseModel):
+    picks: list[Pick]
+
+
+AUDIENCE = yaml.safe_load((Path(__file__).parent / "audience.yaml").read_text(encoding="utf-8"))
+CRITERIA = (f"당신은 세법 소식 뉴스레터 편집자입니다. 독자는 {AUDIENCE['audience']}\n"
+            + "".join(f"- {line}\n" for line in AUDIENCE["importance"])
+            + "자세히 다루지 않을 것: " + ", ".join(AUDIENCE["exclude"]))
+_client = None
+
+
+def llm():
+    global _client                              # 불러오기만 할 때는 키가 없어도 되도록, 처음 쓸 때 만든다
+    if _client is None:
+        load_dotenv(Path(__file__).parent / ".env")
+        _client = OpenAI()
+    return _client
+
+
+def ask_picks(items, n):
+    listing = "\n".join(f"{i}. [{it['source']}] {it['title']}" for i, it in enumerate(items))
+    sys_ = (f"{CRITERIA}\n\n아래 목록에서 중요한 순서대로 {n}건을 고르세요.\n"
+            "같은 사건을 다룬 글에는 같은 event 라벨을 붙이세요.")
+    out = llm().chat.completions.parse(
+        model="gpt-4.1-mini", temperature=0,
+        messages=[{"role": "system", "content": sys_}, {"role": "user", "content": listing}],
+        response_format=Shortlist).choices[0].message.parsed
+    seen, picks = set(), []
+    for p in out.picks:                         # 없는 번호·같은 번호는 버린다
+        if 0 <= p.index < len(items) and p.index not in seen:
+            seen.add(p.index)
+            picks.append(p)
+    return picks
+
+
+def select(s: dict) -> dict:                   # ② 중요도 선별 — 예선(소스 종류별) → 본선
+    items, per, target = s["collected"], AUDIENCE["per_group"], AUDIENCE["target"]
+    log = []
+    survivors = []                              # (글, 예선에서 붙은 이유·라벨 또는 None)
+    for group, sources in AUDIENCE["groups"].items():
+        chunk = [it for it in items if it["source"] in sources]
+        if len(chunk) <= per:                   # 고를 필요가 없으면 LLM 을 부르지 않는다
+            survivors += [(it, None) for it in chunk]
+            log.append(f"   예선 {group}: {len(chunk)}건 → 전부 통과 ({per}건 이하)")
+            continue
+        picks = ask_picks(chunk, per)
+        survivors += [(chunk[p.index], p) for p in picks]
+        log.append(f"   예선 {group}: {len(chunk)}건 → {len(picks)}건")
+
+    if len(survivors) <= target:
+        finals = [(it, p) for it, p in survivors]
+        log.append(f"   본선: {len(survivors)}건 → 전부 선정 ({target}건 이하)")
+    else:
+        # 같은 사건이 겹치면 건너뛰고 다음 순위로 채울 수 있게 넉넉히 받는다(교안 891행)
+        ranked = ask_picks([it for it, _ in survivors], target + 3)
+        finals, events = [], set()
+        for p in ranked:
+            if p.event in events:
+                log.append(f"   본선 중복 사건 건너뜀 [{p.event}] {survivors[p.index][0]['title'][:40]}")
+                continue
+            events.add(p.event)
+            finals.append((survivors[p.index][0], p))
+            if len(finals) == target:
+                break
+        log.append(f"   본선: {len(survivors)}건 → {len(finals)}건")
+
+    picked = []
+    for it, p in finals:
+        picked.append({**it, "event": p.event if p else "", "pick_reason": p.reason if p else ""})
+        log.append(f"   ✔ [{it['source']}] {it['title'][:50]}"
+                   + (f"\n       └ [{p.event}] {p.reason}" if p else ""))
+    return {"picked": picked,
+            "log": [f"② 선별   {len(items)} → 예선 {len(survivors)} → {len(picked)}건"] + log}
 
 
 def report(s: dict) -> dict:                   # ③ 요약
