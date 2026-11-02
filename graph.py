@@ -69,6 +69,15 @@ def ymd(s):
     return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
 
 
+def retry(fn):
+    """본문 요청은 가끔 한 번씩 실패한다. 한 번 더 시도하고, 그래도 실패하면 예외를 그대로 올린다."""
+    try:
+        return fn()
+    except Exception:
+        time.sleep(1)
+        return fn()
+
+
 def nts(source, mi, bbs, seen):
     """국세청 보도자료·공지사항. 목록 한 페이지 10건, 새 글만 상세 페이지에서 본문을 받는다."""
     page = requests.get(f"https://www.nts.go.kr/nts/na/ntt/selectNttList.do?mi={mi}&bbsId={bbs}",
@@ -80,7 +89,10 @@ def nts(source, mi, bbs, seen):
         if f"{source}:{no}" in seen:
             continue
         url = f"https://www.nts.go.kr/nts/na/ntt/selectNttInfo.do?mi={mi}&bbsId={bbs}&nttSn={no}"
-        detail = requests.get(url, headers=UA, timeout=20).text
+        try:
+            detail = retry(lambda: requests.get(url, headers=UA, timeout=20).text)
+        except Exception:
+            detail = ""                         # 두 번 다 실패하면 본문 칸을 못 찾은 것(잘림)으로 남는다
         # 본문은 bbsV_cont 부터 첨부파일 칸 앞까지. 첨부가 없는 글은 이전·다음글 칸 앞까지
         m = re.search(r'class="bbsV_cont">(.*?)<(?:div class="bbsV_atchmnfl"|ul class="bbsV_prne")',
                       detail, flags=re.S)
@@ -130,7 +142,7 @@ def precedent(seen):
         if f"판례·결정례:{d['DOC_ID']}" in seen:
             continue
         try:
-            full = taxlaw("ASIQTB002PR01", {"dcmDVO": {"ntstDcmId": d["DOC_ID"]}})
+            full = retry(lambda: taxlaw("ASIQTB002PR01", {"dcmDVO": {"ntstDcmId": d["DOC_ID"]}}))
             raw = "\n".join(e.get("dcmFleByte") or "" for e in full.get("dcmHwpEditorDVOList") or [])
             media = bool(full.get("cmnFleBrkdDVO") or full.get("fleDVOList"))
         except Exception:
@@ -150,8 +162,8 @@ def amendment(seen):
         if f"최신개정법령:{r['ntstBrkdId']}" in seen:
             continue
         try:
-            dvo = taxlaw("ASISTA003PR01", {"ntstBscId": r["ntstBscId"],
-                                           "ntstBrkdId": r["ntstBrkdId"]}).get("txaStttDVO")
+            dvo = retry(lambda: taxlaw("ASISTA003PR01", {"ntstBscId": r["ntstBscId"],
+                                                         "ntstBrkdId": r["ntstBrkdId"]})).get("txaStttDVO")
             raw = f"{dvo.get('ntstRvsnRsn') or ''}\n{dvo.get('ntstRvsnCntn') or ''}" if dvo else ""
         except Exception:
             raw = None
