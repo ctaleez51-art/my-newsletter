@@ -30,6 +30,8 @@ class Brief(TypedDict):
     collected: list                             # ① 수집한 새 글 — 전부 발행한다
     picked:    list                             # ② 선별해 자세히 다룰 글
     drafted:   Annotated[list, operator.add]    # ③ 취재한 초안 — 워커들이 나눠 채운다
+    checked:   list                             # ④ 검수 합격 — 자세히 싣는다
+    demoted:   list                             # ④ 재요약 뒤에도 불합격 — 제목·링크 목록으로 내린다
     log:       Annotated[list, operator.add]    # 무슨 일이 있었는지
 
 
@@ -216,6 +218,7 @@ def collect(s: dict) -> dict:                  # ① 자료 수집 — 지난번
 
 class Pick(BaseModel):
     index: int = Field(description="후보 목록에서의 번호")
+    title: str = Field(description="고른 글의 제목. 목록에 적힌 그대로 옮겨 쓴다")
     reason: str = Field(description="왜 골랐는지 한 문장")
     event: str = Field(description="이 글이 다루는 사건을 짧은 라벨로. 같은 사건이면 같은 라벨")
 
@@ -247,9 +250,16 @@ def ask_picks(items, n):
         model="gpt-4.1-mini", temperature=0,
         messages=[{"role": "system", "content": sys_}, {"role": "user", "content": listing}],
         response_format=Shortlist).choices[0].message.parsed
+    norm = lambda t: re.sub(r"\W", "", t)       # 따옴표·공백·괄호 차이는 무시하고 글자만 비교
+    titles = [norm(it["title"]) for it in items]
+    same = lambda i: (0 <= i < len(items) and titles[i] and norm(p.title)
+                      and (titles[i] in norm(p.title) or norm(p.title) in titles[i]))
     seen, picks = set(), []
-    for p in out.picks:                         # 없는 번호·같은 번호는 버린다
-        if 0 <= p.index < len(items) and p.index not in seen:
+    for p in out.picks:
+        # 번호와 제목이 어긋나면(모델이 번호를 헷갈림) 제목으로 바로잡는다. 둘 다 안 맞으면 버린다.
+        if not same(p.index):
+            p.index = next((i for i in range(len(items)) if same(i)), -1)
+        if p.index >= 0 and p.index not in seen:     # 없는 번호·같은 번호는 버린다
             seen.add(p.index)
             picks.append(p)
     return picks
@@ -309,6 +319,8 @@ class Draft(BaseModel):
 DRAFT_SYS = (f"당신은 세법 소식 뉴스레터 기자입니다. 독자는 {AUDIENCE['audience']}\n"
              "아래 원문을 읽고 헤드라인·요약·왜 중요한지를 쓰세요.\n"
              "원문에 없는 날짜·금액·대상·조건은 쓰지 마세요.\n"
+             "summary 는 정확히 세 문장이고, 모든 문장을 '~니다.'로 끝내세요.\n"
+             "why 는 한 문장으로, '~니다.'로 끝내세요.\n"
              "'주목된다·기대를 모은다' 같은 기자체 표현은 쓰지 마세요.")
 
 
@@ -322,23 +334,96 @@ def fan_report(s: dict):                       # 선정된 글 수만큼 워커�
     return [Send("report", {"item": it}) for it in s["picked"]]
 
 
+def write_draft(it, problems=None):
+    """글 한 건을 요약한다. problems 가 있으면 지난 요약의 불합격 사유를 알려 주고 다시 쓰게 한다."""
+    body = it["body"][:6000]                   # 본문은 collect 에서 이미 받아 두었다
+    msgs = [{"role": "system", "content": DRAFT_SYS},
+            {"role": "user", "content": f"제목: {it['title']}\n\n{body}"}]
+    if problems:
+        msgs.append({"role": "user", "content": "지난 요약은 검수에서 떨어졌습니다. 아래를 고쳐 다시 쓰세요.\n"
+                                                + "\n".join(f"- {p}" for p in problems)})
+    d = llm().chat.completions.parse(model="gpt-4.1-mini", temperature=0, messages=msgs,
+                                     response_format=Draft).choices[0].message.parsed
+    return {**it, "body": body, **d.model_dump()}
+
+
 def report(s: ReportIn) -> dict:               # ③ 요약 — 글 한 건을 맡는다
     it = s["item"]
-    body = it["body"][:6000]                   # 본문은 collect 에서 이미 받아 두었다
     try:
-        d = llm().chat.completions.parse(
-            model="gpt-4.1-mini", temperature=0,
-            messages=[{"role": "system", "content": DRAFT_SYS},
-                      {"role": "user", "content": f"제목: {it['title']}\n\n{body}"}],
-            response_format=Draft).choices[0].message.parsed
+        d = write_draft(it)
     except Exception as e:                     # 한 건이 실패해도 나머지 워커는 계속
         return {"drafted": [], "log": [f"③ 취재 실패 [{it['source']}] {it['title'][:40]} ({type(e).__name__})"]}
-    return {"drafted": [{**it, "body": body, **d.model_dump()}],
-            "log": [f"③ 취재   [{it['source']}] {d.headline}"]}
+    return {"drafted": [d], "log": [f"③ 취재   [{it['source']}] {d['headline']}"]}
 
 
-def verify(s: dict) -> dict:                   # ④ 검수
-    return {"log": [f"④ 검수   {len(s['drafted'])}건 (빈 노드)"]}
+# ── ④ 검수: LLM 원문 대조 + 코드 규칙 ──────────────────────────────────
+# 불합격이면 사유를 붙여 한 번 다시 요약한다. 다시 불합격이면 자세히 싣지 않고 목록으로 내린다.
+
+class Verdict(BaseModel):
+    ok: bool = Field(description="요약·헤드라인·why 가 모두 원문에 근거하면 true")
+    problems: list[str] = Field(description="원문에 없거나 원문과 다른 내용. 문제가 없으면 빈 목록")
+
+
+VERIFY_SYS = ("당신은 세법 뉴스레터 검수자입니다. 원문과 요약을 대조하세요.\n"
+              "헤드라인·요약·why 에 원문에 없거나 원문과 다른 날짜·금액·대상·조건·사실이 있으면 불합격입니다.\n"
+              "원문 내용을 줄이거나 쉽게 바꿔 쓴 것은 문제가 아닙니다.")
+
+
+def sentences(text):
+    return [x for x in re.split(r"(?<=[.?!])\s+", text.strip()) if x]
+
+
+def rule_problems(d):
+    """문체·문장 수 검사. 코드로 확실히 잴 수 있는 것만 본다."""
+    out = []
+    summ = sentences(d["summary"])
+    if len(summ) != 3:
+        out.append(f"summary 가 세 문장이 아니라 {len(summ)}문장입니다.")
+    if any(not x.endswith("니다.") for x in summ):
+        out.append("summary 에 '~니다.'로 끝나지 않는 문장이 있습니다.")
+    why = sentences(d["why"])
+    if len(why) != 1:
+        out.append(f"why 가 한 문장이 아니라 {len(why)}문장입니다.")
+    if any(not x.endswith("니다.") for x in why):
+        out.append("why 가 '~니다.'로 끝나지 않습니다.")
+    return out
+
+
+def llm_problems(d):
+    v = llm().chat.completions.parse(
+        model="gpt-4.1-mini", temperature=0,
+        messages=[{"role": "system", "content": VERIFY_SYS},
+                  {"role": "user", "content": f"[원문]\n제목: {d['title']}\n{d['body']}\n\n"
+                                              f"[요약]\n헤드라인: {d['headline']}\n요약: {d['summary']}\n"
+                                              f"why: {d['why']}"}],
+        response_format=Verdict).choices[0].message.parsed
+    return [] if v.ok else (v.problems or ["원문과 다른 내용이 있습니다."])
+
+
+def check(d):
+    return rule_problems(d) + llm_problems(d)
+
+
+def verify(s: dict) -> dict:                   # ④ 검수 — 불합격이면 1회 재요약, 재불합격이면 목록으로
+    checked, demoted, log = [], [], []
+    for d in s["drafted"]:
+        name = f"[{d['source']}] {d['headline']}"
+        try:
+            problems = check(d)
+            if problems:
+                log.append(f"   ✘ {name} — 재요약\n" + "".join(f"       └ {p}\n" for p in problems).rstrip())
+                d = write_draft(d, problems)
+                problems = check(d)
+        except Exception as e:                 # 검수 자체가 실패하면 확인 안 된 요약이므로 싣지 않는다
+            problems = [f"검수 실패 ({type(e).__name__})"]
+        if problems:
+            demoted.append({**d, "problems": problems})
+            log.append(f"   ✘ {name} — 목록으로 내림\n" + "".join(f"       └ {p}\n" for p in problems).rstrip())
+        else:
+            checked.append(d)
+            log.append(f"   ✔ {name}")
+    return {"checked": checked, "demoted": demoted,
+            "log": [f"④ 검수   {len(s['drafted'])}건 → 합격 {len(checked)} · 목록으로 내림 {len(demoted)}"] + log}
 
 
 def publish(s: dict) -> dict:                  # ⑤ 발행
@@ -359,7 +444,8 @@ def build():                                    # 노드를 이름으로 찾아 
 
 
 def run():
-    init = {"seen": load_seen(), "collected": [], "picked": [], "drafted": [], "log": []}
+    init = {"seen": load_seen(), "collected": [], "picked": [], "drafted": [],
+            "checked": [], "demoted": [], "log": []}
     return build().compile().invoke(init)
 
 
