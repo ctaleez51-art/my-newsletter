@@ -440,8 +440,8 @@ MSG_MAX = 5800                                 # 메시지 하나의 embed 글�
 COLOR = 0x2B6CB0
 
 
-def esc(t):                                    # 제목의 [ ] 가 링크 문법을 깨지 않게
-    return t.replace("[", "\\[").replace("]", "\\]")
+def esc(t):                                    # 제목의 [ ] 가 링크 문법을 깨지 않게 전각 괄호로 바꾼다
+    return t.replace("[", "［").replace("]", "］")   # \[ 로 막으면 Discord 가 \ 를 그대로 보여 준다
 
 
 def no(it):                                    # 홈택스 글번호 (다른 소스는 링크가 글로 바로 가므로 없음)
