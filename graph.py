@@ -117,9 +117,11 @@ def hometax(seen):
         id_ = f"{r['tbbsSn']}@{r['lstAltDtm']}"          # 글번호 + 수정일시: 고치면 새 번호가 된다
         if f"홈택스 공지사항:{id_}" in seen:
             continue
-        # 글마다 주소가 없어 공지사항 목록 주소를 링크로 쓴다
+        # 글마다 주소가 없어(상세 화면 주소에 글번호가 안 들어감) 공지사항 목록 주소를 링크로 쓴다.
+        # menuCd=UTXPPBAA26 만 주면 첫 화면으로 돌아가므로, 메뉴 번호(tmIdx·tm2lIdx)로 연다.
         out.append(item("홈택스 공지사항", id_, r["tbbsTtl"],
-                        "https://hometax.go.kr/websquare/websquare.html?w2xPath=/ui/pp/index_pp.xml&menuCd=index3",
+                        "https://hometax.go.kr/websquare/websquare.html?w2xPath=/ui/pp/index_pp.xml"
+                        "&tmIdx=16&tm2lIdx=1601000000&tm3lIdx=",
                         ymd(r["lstAltDtm"]), r["tbbsCntn"] or ""))
     return out, len(rows)
 
