@@ -32,6 +32,7 @@ class Brief(TypedDict):
     drafted:   Annotated[list, operator.add]    # ③ 취재한 초안 — 워커들이 나눠 채운다
     checked:   list                             # ④ 검수 합격 — 자세히 싣는다
     demoted:   list                             # ④ 재요약 뒤에도 불합격 — 제목·링크 목록으로 내린다
+    sent:      str                              # ⑤ 발행 결과: 발송 완료 / DRY_RUN / 발송 실패
     log:       Annotated[list, operator.add]    # 무슨 일이 있었는지
 
 
@@ -426,8 +427,88 @@ def verify(s: dict) -> dict:                   # ④ 검수 — 불합격이면 
             "log": [f"④ 검수   {len(s['drafted'])}건 → 합격 {len(checked)} · 목록으로 내림 {len(demoted)}"] + log}
 
 
-def publish(s: dict) -> dict:                  # ⑤ 발행
-    return {"log": [f"⑤ 발행   {len(s['drafted'])}건 (빈 노드)"]}
+# ── ⑤ 발행: Discord 웹훅 ──────────────────────────────────────────
+# 핵심 글은 embed 하나씩 자세히, 나머지 새 글은 전부 소스별 제목·링크 목록으로 싣는다.
+# DRY_RUN=1(기본)이면 보내지 않고 보낼 내용만 로그에 찍는다. seen.json 은 실제 발송이 모두 성공한 뒤에만 저장한다.
+
+DESC_MAX = 3800                                # embed 설명칸 4,096자 제한보다 조금 작게 자른다
+MSG_MAX = 5800                                 # 메시지 하나의 embed 글자 합 6,000자 제한
+COLOR = 0x2B6CB0
+
+
+def esc(t):                                    # 제목의 [ ] 가 링크 문법을 깨지 않게
+    return t.replace("[", "\\[").replace("]", "\\]")
+
+
+def build_messages(s):
+    """보낼 메시지 목록. 메시지마다 embed 최대 10개, 글자 합 MSG_MAX 이하."""
+    today = time.strftime("%Y-%m-%d")
+    top = s["checked"]
+    if not s["collected"]:
+        return [{"content": f"📮 세법 뉴스레터 {today} — 오늘은 새 글이 없습니다."}]
+
+    embeds = [{"title": d["headline"][:256], "url": d["url"], "color": COLOR,
+               "description": f"{d['summary']}\n\n**왜 중요한가** {d['why']}"[:DESC_MAX],
+               "footer": {"text": f"{d['source']} · {d['at']} · 원문: {d['title'][:150]}"}} for d in top]
+
+    # 나머지 새 글: 소스별 제목·링크. 길면 여러 embed 로 나눈다.
+    shown = {d["id"] for d in top}
+    rest = [it for it in s["collected"] if it["id"] not in shown]
+    for name, _ in SOURCES:
+        lines = [f"• [{esc(it['title'][:120])}]({it['url']}) `{it['at']}`"
+                 for it in rest if it["source"] == name]
+        part, n = [], 1
+        for line in lines + [None]:
+            if line is None or len("\n".join(part + [line])) > DESC_MAX:
+                if part:
+                    title = f"{name} 새 글 {len(lines)}건" + (f" ({n})" if n > 1 else "")
+                    embeds.append({"title": title, "description": "\n".join(part), "color": 0x718096})
+                    part, n = [], n + 1
+            if line is not None:
+                part.append(line)
+
+    head = (f"📮 **세법 뉴스레터 {today}** — 새 글 {len(s['collected'])}건 중 "
+            f"핵심 {len(top)}건을 자세히, 나머지 {len(rest)}건은 목록으로 싣습니다.")
+    msgs, cur, size = [], [], 0
+    for e in embeds:
+        n = len(e["title"]) + len(e.get("description", "")) + len(e.get("footer", {}).get("text", ""))
+        if cur and (len(cur) == 10 or size + n > MSG_MAX):
+            msgs.append({"embeds": cur})
+            cur, size = [], 0
+        cur.append(e)
+        size += n
+    msgs.append({"embeds": cur})
+    msgs[0]["content"] = head
+    return msgs
+
+
+def send(url, msg):
+    r = requests.post(url + "?wait=true", json=msg, timeout=20)
+    if r.status_code == 429:                   # 너무 빨리 보냈으면 알려 준 시간만큼 쉬고 한 번 더
+        time.sleep(float(r.json().get("retry_after", 1)))
+        r = requests.post(url + "?wait=true", json=msg, timeout=20)
+    r.raise_for_status()
+
+
+def publish(s: dict) -> dict:                  # ⑤ 발행 — 성공하면 seen.json 갱신
+    import os
+    load_dotenv(Path(__file__).parent / ".env")
+    msgs = build_messages(s)
+    dry = os.getenv("DRY_RUN", "1") != "0"
+    head = f"⑤ 발행   핵심 {len(s['checked'])}건 + 목록, 메시지 {len(msgs)}개"
+    if dry:
+        preview = json.dumps(msgs, ensure_ascii=False, indent=1)
+        return {"sent": "DRY_RUN", "log": [head + " — DRY_RUN=1 이라 보내지 않음 (seen.json 그대로)", preview]}
+    try:
+        for m in msgs:
+            send(os.environ["DISCORD_WEBHOOK_URL"], m)
+            time.sleep(0.5)
+    except Exception as e:                     # 발송이 실패하면 seen 을 저장하지 않는다 → 다음 실행에서 다시 받는다
+        return {"sent": "발송 실패", "log": [head + f" — 발송 실패 ({type(e).__name__}), seen.json 저장 안 함"]}
+    seen = s["seen"] + [it["id"] for it in s["collected"]]
+    STORE.mkdir(exist_ok=True)
+    SEEN.write_text(json.dumps(seen, ensure_ascii=False, indent=0), encoding="utf-8")
+    return {"sent": "발송 완료", "log": [head + f" — 발송 완료, seen.json {len(seen)}건 저장"]}
 
 
 def build():                                    # 노드를 이름으로 찾아 붙인다
@@ -445,7 +526,7 @@ def build():                                    # 노드를 이름으로 찾아 
 
 def run():
     init = {"seen": load_seen(), "collected": [], "picked": [], "drafted": [],
-            "checked": [], "demoted": [], "log": []}
+            "checked": [], "demoted": [], "sent": "", "log": []}
     return build().compile().invoke(init)
 
 
