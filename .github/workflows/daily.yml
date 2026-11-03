@@ -5,7 +5,6 @@ name: daily
 on:
   schedule:
     - cron: "0 3 * * *"          # UTC 03:00 = 한국 12:00
-    - cron: "30 4 3 11 *"        # 예약 실행 시험: 2026-11-03 한국 13:30 한 번. 확인 뒤 지운다
   workflow_dispatch:
 
 permissions:
