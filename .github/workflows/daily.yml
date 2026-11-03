@@ -1,0 +1,41 @@
+name: daily
+
+# 매일 12:00(한국 시각)에 뉴스레터를 만들어 Discord 로 보낸다. 수동 실행도 같은 작업을 돌린다.
+# Actions 환경은 실행이 끝나면 파일이 지워지므로, 갱신된 seen.json·metrics.jsonl 을 저장소에 다시 커밋한다.
+on:
+  schedule:
+    - cron: "0 3 * * *"          # UTC 03:00 = 한국 12:00
+  workflow_dispatch:
+
+permissions:
+  contents: write                # seen.json 을 다시 커밋하기 위해
+
+jobs:
+  newsletter:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 패키지 설치
+        run: pip install -r requirements.txt
+
+      - name: 뉴스레터 실행
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DRY_RUN: "0"
+        run: python run.py
+
+      - name: 실행 기록 커밋
+        if: always()             # 발송이 실패해도 metrics.jsonl 은 남긴다(seen.json 은 publish 가 성공할 때만 바뀐다)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add store/seen.json store/metrics.jsonl
+          git diff --cached --quiet || git commit -m "daily: 실행 기록 $(TZ=Asia/Seoul date +%F)"
+          git push
