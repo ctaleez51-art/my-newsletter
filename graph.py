@@ -112,6 +112,7 @@ def hometax(seen):
     body = {"blrdNo": "1", "endDt": "", "schCntn": "", "schType": "all", "strtDt": "",
             "tbbsClsfCd": "all", "pageInfoVO": {"totalCount": "0", "pageSize": "20", "pageNum": "1"}}
     rows = requests.post(url, json=body, headers=UA, timeout=20).json()["intgTbbsInqrDVOList"]
+    rows = [r for r in rows if r.get("prfcAnncMttrYn") != "Y"]   # 맨 위 고정공지는 예전 글이므로 뺀다
     out = []
     for r in rows:
         id_ = f"{r['tbbsSn']}@{r['lstAltDtm']}"          # 글번호 + 수정일시: 고치면 새 번호가 된다
@@ -123,6 +124,7 @@ def hometax(seen):
                         "https://hometax.go.kr/websquare/websquare.html?w2xPath=/ui/pp/index_pp.xml"
                         "&tmIdx=16&tm2lIdx=1601000000&tm3lIdx=",
                         ymd(r["lstAltDtm"]), r["tbbsCntn"] or ""))
+        out[-1]["no"] = r["tbbsSn"]                  # 목록 화면의 '번호'. 링크가 목록으로 가므로 이 번호로 찾는다
     return out, len(rows)
 
 
@@ -442,6 +444,10 @@ def esc(t):                                    # 제목의 [ ] 가 링크 문법
     return t.replace("[", "\\[").replace("]", "\\]")
 
 
+def no(it):                                    # 홈택스 글번호 (다른 소스는 링크가 글로 바로 가므로 없음)
+    return f" No.{it['no']}" if it.get("no") else ""
+
+
 def build_messages(s):
     """보낼 메시지 목록. 메시지마다 embed 최대 10개, 글자 합 MSG_MAX 이하."""
     today = time.strftime("%Y-%m-%d")
@@ -451,13 +457,13 @@ def build_messages(s):
 
     embeds = [{"title": d["headline"][:256], "url": d["url"], "color": COLOR,
                "description": f"{d['summary']}\n\n**왜 중요한가** {d['why']}"[:DESC_MAX],
-               "footer": {"text": f"{d['source']} · {d['at']} · 원문: {d['title'][:150]}"}} for d in top]
+               "footer": {"text": f"{d['source']}{no(d)} · {d['at']} · 원문: {d['title'][:150]}"}} for d in top]
 
     # 나머지 새 글: 소스별 제목·링크. 길면 여러 embed 로 나눈다.
     shown = {d["id"] for d in top}
     rest = [it for it in s["collected"] if it["id"] not in shown]
     for name, _ in SOURCES:
-        lines = [f"• [{esc(it['title'][:120])}]({it['url']}) `{it['at']}`"
+        lines = [f"• [{esc(it['title'][:120])}]({it['url']}){no(it)} `{it['at']}`"
                  for it in rest if it["source"] == name]
         part, n = [], 1
         for line in lines + [None]:
