@@ -106,7 +106,7 @@ def nts(source, mi, bbs, seen):
 
 
 def hometax(seen):
-    """홈택스 공지사항. 본문이 목록과 함께 온다. 수정일 순이라 고쳐 올린 글도 새 글로 본다."""
+    """홈택스 공지사항. 본문이 목록과 함께 온다. 고친 글은 작성일이 바뀐 경우에만 새 글로 본다."""
     url = ("https://hometax.go.kr/wqAction.do?actionId=ATXPPBAA001R01"
            "&screenId=UTXPPBAA26&popupYn=false&realScreenId=")
     body = {"blrdNo": "1", "endDt": "", "schCntn": "", "schType": "all", "strtDt": "",
@@ -115,7 +115,7 @@ def hometax(seen):
     rows = [r for r in rows if r.get("prfcAnncMttrYn") != "Y"]   # 맨 위 고정공지는 예전 글이므로 뺀다
     out = []
     for r in rows:
-        id_ = f"{r['tbbsSn']}@{r['lstAltDtm']}"          # 글번호 + 수정일시: 고치면 새 번호가 된다
+        id_ = f"{r['tbbsSn']}@{r['bltnStrtDt']}"         # 글번호 + 작성일: 작성일이 바뀌면 새 글이 된다
         if f"홈택스 공지사항:{id_}" in seen:
             continue
         # 글마다 주소가 없어(상세 화면 주소에 글번호가 안 들어감) 공지사항 목록 주소를 링크로 쓴다.
