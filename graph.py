@@ -6,6 +6,7 @@
 import html
 import json
 import operator
+import os
 import re
 import time
 from pathlib import Path
@@ -66,6 +67,24 @@ def item(source, id_, title, url, at, raw_body, has_media=False):
         status = "정상" if body else "빈 본문"
     return {"id": f"{source}:{id_}", "title": title, "url": url, "source": source,
             "at": at, "body": body, "status": status}
+
+
+def why(e):
+    """오류 이름·메시지와 그 오류를 일으킨 원래 오류까지 한 줄로. 로그에 원인이 남게 한다.
+    Actions 로그는 공개이므로 OpenAI 키·Discord 웹훅 주소는 *** 로 가린다."""
+    load_dotenv(Path(__file__).parent / ".env")
+    parts, cur = [], e
+    while cur is not None and len(parts) < 4:
+        line = f"{type(cur).__name__}: {cur}"
+        if line not in parts:                   # 같은 원인이 겹겹이 감싸여 오면 한 번만 적는다
+            parts.append(line)
+        cur = cur.__cause__ or cur.__context__
+    text = re.sub(r"\s+", " ", " ← ".join(parts))
+    for key in ("OPENAI_API_KEY", "DISCORD_WEBHOOK_URL"):
+        value = (os.getenv(key) or "").strip()
+        if value:
+            text = text.replace(value, "***")
+    return text[:600]
 
 
 def ymd(s):
@@ -203,7 +222,7 @@ def collect(s: dict) -> dict:                  # ① 자료 수집 — 지난번
             new, listed = fetch(seen)
         except Exception as e:
             dead.append(name)                   # 한 곳이 죽어도 나머지는 계속
-            lines.append(f"   {name}: 응답 없음 ({type(e).__name__})")
+            lines.append(f"   {name}: 응답 없음 ({why(e)})")
             continue
         items += new
         count = {k: sum(i["status"] == k for i in new) for k in ("정상", "이미지·첨부만", "빈 본문", "잘림")}
@@ -357,7 +376,7 @@ def report(s: ReportIn) -> dict:               # ③ 요약 — 글 한 건을 �
     try:
         d = write_draft(it)
     except Exception as e:                     # 한 건이 실패해도 나머지 워커는 계속
-        return {"drafted": [], "log": [f"③ 취재 실패 [{it['source']}] {it['title'][:40]} ({type(e).__name__})"]}
+        return {"drafted": [], "log": [f"③ 취재 실패 [{it['source']}] {it['title'][:40]} ({why(e)})"]}
     return {"drafted": [d], "log": [f"③ 취재   [{it['source']}] {d['headline']}"]}
 
 
@@ -420,7 +439,7 @@ def verify(s: dict) -> dict:                   # ④ 검수 — 불합격이면 
                 d = write_draft(d, problems)
                 problems = check(d)
         except Exception as e:                 # 검수 자체가 실패하면 확인 안 된 요약이므로 싣지 않는다
-            problems = [f"검수 실패 ({type(e).__name__})"]
+            problems = [f"검수 실패 ({why(e)})"]
         if problems:
             demoted.append({**d, "problems": problems})
             log.append(f"   ✘ {name} — 목록으로 내림\n" + "".join(f"       └ {p}\n" for p in problems).rstrip())
@@ -499,7 +518,6 @@ def send(url, msg):
 
 
 def publish(s: dict) -> dict:                  # ⑤ 발행 — 성공하면 seen.json 갱신
-    import os
     load_dotenv(Path(__file__).parent / ".env")
     msgs = build_messages(s)
     dry = os.getenv("DRY_RUN", "1") != "0"
@@ -512,7 +530,7 @@ def publish(s: dict) -> dict:                  # ⑤ 발행 — 성공하면 see
             send(os.environ["DISCORD_WEBHOOK_URL"], m)
             time.sleep(0.5)
     except Exception as e:                     # 발송이 실패하면 seen 을 저장하지 않는다 → 다음 실행에서 다시 받는다
-        return {"sent": "발송 실패", "log": [head + f" — 발송 실패 ({type(e).__name__}), seen.json 저장 안 함"]}
+        return {"sent": "발송 실패", "log": [head + f" — 발송 실패 ({why(e)}), seen.json 저장 안 함"]}
     seen = s["seen"] + [it["id"] for it in s["collected"]]
     STORE.mkdir(exist_ok=True)
     SEEN.write_text(json.dumps(seen, ensure_ascii=False, indent=0), encoding="utf-8")
