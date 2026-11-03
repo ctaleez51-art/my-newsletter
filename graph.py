@@ -40,7 +40,7 @@ class Brief(TypedDict):
 # 요청 방식은 measure_sources.py 로 확인한 것과 같다. 소스마다 최신 글 목록을 받아
 # 아래 항목으로 통일한다.
 #   id      소스 안에서 글을 구별하는 번호 (seen.json 에 적는 값)
-#   title · url · source · at(게시일, 홈택스는 수정일) · body(본문 글자)
+#   title · url · source · at(게시일 — 사이트 화면에 보이는 날짜) · body(본문 글자)
 #   status  정상 / 이미지·첨부만 / 빈 본문 / 잘림(본문을 못 찾음 = 수집 실패)
 
 def strip_tags(s):
@@ -123,7 +123,7 @@ def hometax(seen):
         out.append(item("홈택스 공지사항", id_, r["tbbsTtl"],
                         "https://hometax.go.kr/websquare/websquare.html?w2xPath=/ui/pp/index_pp.xml"
                         "&tmIdx=16&tm2lIdx=1601000000&tm3lIdx=",
-                        ymd(r["lstAltDtm"]), r["tbbsCntn"] or ""))
+                        ymd(r["bltnStrtDt"]), r["tbbsCntn"] or ""))   # 날짜는 화면의 '작성일'과 같은 값
         out[-1]["no"] = r["tbbsSn"]                  # 목록 화면의 '번호'. 링크가 목록으로 가므로 이 번호로 찾는다
     return out, len(rows)
 
